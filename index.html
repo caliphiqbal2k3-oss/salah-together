@@ -7,6 +7,9 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="Salah Together">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" type="image/png" href="icon-192.png">
 <meta name="theme-color" content="#f7f5f0">
 <title>Salah Together</title>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -184,6 +187,13 @@ button.box{cursor:pointer;font-family:inherit}
 
     <div id="inbox" class="inbox hidden" role="status" aria-live="polite"></div>
 
+    <div id="notifNudge" class="card hidden">
+      <b>🔔 Get reminders on your lock screen</b>
+      <p class="small muted" id="nudgeText" style="margin:6px 0 0"></p>
+      <button class="btn" id="nudgeBtn" type="button">Turn on notifications</button>
+      <button class="btn ghost" id="nudgeLater" type="button">Not now</button>
+    </div>
+
     <div class="datebox">
       <div class="day" id="dDay"></div>
       <div class="date" id="dDate"></div>
@@ -229,6 +239,14 @@ button.box{cursor:pointer;font-family:inherit}
     </div>
 
     <div class="card">
+      <h2>Notifications</h2>
+      <p class="small muted" id="notifText" style="margin:0">Checking…</p>
+      <button class="btn hidden" id="notifOnBtn" type="button">Turn on notifications 🔔</button>
+      <button class="btn secondary hidden" id="notifTestBtn" type="button">Send a test notification</button>
+      <button class="btn ghost hidden" id="notifOffBtn" type="button">Turn off on this phone</button>
+    </div>
+
+    <div class="card">
       <h2>Appearance</h2>
       <div class="seg" id="themeSeg">
         <button data-theme="light" type="button">Light</button>
@@ -271,6 +289,7 @@ const ERRORS = {
   bad_name: "Please enter a name (up to 40 letters).",
   bad_timezone: "Please choose a time zone from the list.",
   bad_message: "Please write a short message (up to 100 letters).",
+  bad_subscription: "This phone couldn't be set up for notifications. Please try again.",
 };
 function friendly(err){
   const m = (err && (err.message || err.error_description || String(err))) || '';
@@ -466,7 +485,7 @@ function route(){
   if (S.screen === 'settings'){ renderSettings(); return; }
   if (S.screen === 'recover') return;
   if (!S.partner){ renderPairing(); show('pairing'); }
-  else { renderHome(); show('home'); }
+  else { renderHome(); show('home'); updateNotifUI(); }
 }
 
 /* ============ LIVE UPDATES ============ */
@@ -667,9 +686,10 @@ function openReminder(prayer){
     if (!text) return toast('Please write a short message.');
     $('sendRem').disabled = true;
     try {
-      const { error } = await sb.rpc('send_reminder', { p_prayer: prayer, p_message: text });
+      const { data: rid, error } = await sb.rpc('send_reminder', { p_prayer: prayer, p_message: text });
       if (error) throw error;
       close(); toast('Reminder sent 🤍');
+      if (rid) sb.functions.invoke('send-push', { body: { reminder_id: rid } }).catch(() => {});
       S.sentReminders.push({ prayer, day: partnerDays().today, created_at: new Date().toISOString() });
       renderHome();
     } catch(err){
@@ -704,6 +724,7 @@ function renderSettings(){
       ? new Date(S.pair.connected_at).toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'}) : '';
   }
   applyTheme(getTheme());
+  updateNotifUI();
 }
 function openSettings(){ msg('settingsMsg',''); renderSettings(); show('settings'); }
 $('settingsBtn').onclick = openSettings;
@@ -734,7 +755,7 @@ $('unpairBtn').onclick = async () => {
     toast('Unpaired'); S.screen = null; await refresh();
   } catch(err){ msg('settingsMsg', friendly(err), true); }
 };
-$('logoutBtn').onclick = async () => { await sb.auth.signOut(); };
+$('logoutBtn').onclick = async () => { await disableNotifs(true); await sb.auth.signOut(); };
 $('deleteBtn').onclick = async () => {
   if (!confirm('Delete your account and all your prayer history? This cannot be undone.')) return;
   if (!confirm('Are you sure? This is permanent.')) return;
@@ -754,6 +775,109 @@ function tick(){
   if (S.screen === 'home' && !document.querySelector('.overlay')) renderHome();
 }
 
+/* ============ PHONE NOTIFICATIONS ============ */
+const VAPID_PUBLIC = 'BP2tyGDu_-f_UXB37QirpQmGbbqDEe9X1h_2f0GLs3tqBObW99LyqN-zXOXTLg6bLHrhFpuyDDD6O72xTDlaNoQ';
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isStandalone = () => (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+let swReg = null;
+async function getReg(){
+  if (swReg) return swReg;
+  if (!('serviceWorker' in navigator)) return null;
+  try { await navigator.serviceWorker.register('sw.js'); swReg = await navigator.serviceWorker.ready; return swReg; }
+  catch(e){ console.error(e); return null; }
+}
+function b64ToBytes(s){
+  const p = (s + '==='.slice((s.length + 3) % 4)).replace(/-/g,'+').replace(/_/g,'/');
+  const bin = atob(p); const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+async function currentSub(){
+  const r = await getReg(); if (!r || !r.pushManager) return null;
+  try { return await r.pushManager.getSubscription(); } catch(e){ return null; }
+}
+async function saveSub(sub){
+  const j = sub.toJSON();
+  const { error } = await sb.rpc('save_push_subscription', { p_endpoint: j.endpoint, p_p256dh: j.keys.p256dh, p_auth: j.keys.auth });
+  if (error) throw error;
+}
+async function notifState(){
+  if (!pushSupported()) return (isIOS && !isStandalone()) ? 'ios-home' : 'unsupported';
+  if (Notification.permission === 'denied') return 'blocked';
+  if (Notification.permission !== 'granted') return 'off';
+  return (await currentSub()) ? 'on' : 'off';
+}
+async function enableNotifs(){
+  try {
+    const perm = await Notification.requestPermission();   // must be the first thing after the tap
+    if (perm !== 'granted'){ await updateNotifUI(); return; }
+    const reg = await getReg();
+    if (!reg) throw new Error('no_service_worker');
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(VAPID_PUBLIC) });
+    await saveSub(sub);
+    toast('Notifications are on 🤍');
+  } catch(err){ toast(friendly(err)); }
+  await updateNotifUI();
+}
+async function disableNotifs(quiet){
+  try {
+    const sub = pushSupported() ? await currentSub() : null;
+    if (sub){
+      try { await sb.rpc('delete_push_subscription', { p_endpoint: sub.endpoint }); } catch(e){}
+      await sub.unsubscribe();
+    }
+    if (!quiet) toast('Notifications turned off on this phone');
+  } catch(e){ if (!quiet) toast(friendly(e)); }
+  if (!quiet) await updateNotifUI();
+}
+async function pushSync(){
+  try {
+    if (pushSupported() && Notification.permission === 'granted'){
+      const sub = await currentSub(); if (sub) await saveSub(sub);
+    }
+  } catch(e){}
+  await updateNotifUI();
+}
+function nudgeDismissed(){ try { return localStorage.getItem('nudgeLater') === '1'; } catch(e){ return false; } }
+async function updateNotifUI(){
+  const st = await notifState();
+  const pName = S.partner ? firstName(S.partner.name) : 'your partner';
+  const text = {
+    'ios-home': 'On iPhone, notifications only work from the Home Screen app. In Safari tap Share → "Add to Home Screen", then open Salah Together from your Home Screen and come back here.',
+    'unsupported': "This browser can't show notifications. On iPhone use Safari (from the Home Screen). On Android use Chrome.",
+    'blocked': 'Notifications are blocked for this app. On iPhone: Settings → Notifications → Salah Together → Allow Notifications. Then come back here.',
+    'off': `Get a notification on your lock screen when ${pName} reminds you, even when the app is closed.`,
+    'on': 'Notifications are on for this phone ✅',
+  }[st];
+  $('notifText').textContent = text;
+  $('notifOnBtn').classList.toggle('hidden', st !== 'off');
+  $('notifTestBtn').classList.toggle('hidden', st !== 'on');
+  $('notifOffBtn').classList.toggle('hidden', st !== 'on');
+  const nudge = (st === 'off' || st === 'ios-home') && !nudgeDismissed() && !!S.partner;
+  $('notifNudge').classList.toggle('hidden', !nudge);
+  $('nudgeText').textContent = st === 'ios-home'
+    ? 'First add this app to your Home Screen: tap Share → "Add to Home Screen". Then open it from there.'
+    : `So you see it when ${pName} reminds you, even when the app is closed.`;
+  $('nudgeBtn').textContent = st === 'ios-home' ? 'Show me how' : 'Turn on notifications';
+  $('nudgeBtn').dataset.state = st;
+}
+$('notifOnBtn').onclick = enableNotifs;
+$('notifOffBtn').onclick = () => disableNotifs(false);
+$('notifTestBtn').onclick = async () => {
+  $('notifTestBtn').disabled = true;
+  try {
+    const { data, error } = await sb.functions.invoke('send-push', { body: { test: true } });
+    if (error) throw error;
+    if (data && data.sent > 0) toast('Test sent 🤍 Lock your phone, it should appear in a few seconds.', 4500);
+    else toast("The test couldn't reach this phone. Try turning notifications off and on again.", 4500);
+  } catch(err){ toast(friendly(err)); }
+  $('notifTestBtn').disabled = false;
+};
+$('nudgeBtn').onclick = () => { if ($('nudgeBtn').dataset.state === 'off') enableNotifs(); else openSettings(); };
+$('nudgeLater').onclick = () => { try { localStorage.setItem('nudgeLater','1'); } catch(e){} $('notifNudge').classList.add('hidden'); };
+
 /* ============ START ============ */
 async function boot(){
   const { data } = await sb.auth.getSession();
@@ -766,6 +890,7 @@ async function boot(){
   S.screen = (S.screen === 'settings' || S.screen === 'recover') ? S.screen : null;
   await refresh();
   subscribe();
+  pushSync();
   clearInterval(S.clockTimer); S.clockTimer = setInterval(tick, 30000);
 }
 
@@ -775,6 +900,7 @@ function start(){
     return;
   }
   sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  getReg();
   let booted = false;
   sb.auth.onAuthStateChange((event, session) => {
     if (event === 'PASSWORD_RECOVERY'){ S.session = session; show('recover'); return; }
