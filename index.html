@@ -363,7 +363,8 @@ function parseInterval(v){
   if (h || mi) return ((h?+h[1]:0)*3600 + (mi?+mi[1]:0)*60)*1000;
   return null;
 }
-const firstName = n => (n || '').trim().split(/\s+/)[0] || 'Partner';
+const firstName = n => ((n || '').trim().split(/\s+/)[0] || '').replace(/[.,!?;:]+$/, '') || 'Partner';
+function shortDay(ymd){ const [y,m,d] = ymd.split('-').map(Number); return new Date(Date.UTC(y,m-1,d,12)).toLocaleDateString('en-GB',{weekday:'short', day:'numeric', month:'short', timeZone:'UTC'}); }
 const key = (u,d,p) => `${u}|${d}|${p}`;
 function myDays(){ const t = dateIn(S.me.timezone); return {today:t, yesterday:minusDay(t)}; }
 function partnerDays(){ if(!S.partner) return null; const t = dateIn(S.partner.timezone); return {today:t, yesterday:minusDay(t)}; }
@@ -567,10 +568,12 @@ function renderHome(){
   const pdisp = prettyDate(myDay);
   $('dDay').textContent = isToday ? pdisp.day : 'Yesterday · ' + pdisp.day;
   $('dDate').textContent = pdisp.date;
-  $('pTime').textContent = `${pName}'s time: ${timeIn(pa.timezone)}` + (pd.today !== md.today ? ` (${prettyDate(pd.today).day})` : '');
+  $('pTime').textContent = `${pName}'s time: ${timeIn(pa.timezone)}` + (pd.today !== md.today ? ` · ${prettyDate(pd.today).day} there` : '');
   $('segToday').classList.toggle('on', isToday);
   $('segYest').classList.toggle('on', !isToday);
-  $('colPartner').textContent = pName;
+  const split = paDay !== myDay;
+  $('colMe').textContent = split ? `You · ${shortDay(myDay)}` : 'You';
+  $('colPartner').textContent = split ? `${pName} · ${shortDay(paDay)}` : pName;
 
   let mine = 0, theirs = 0;
   const now = Date.now();
@@ -587,7 +590,7 @@ function renderHome(){
         : `<button class="remind" data-remind="${p.id}">Remind ${esc(pName)} 🤍</button>`;
     }
     return `<div class="prayer">
-      <div class="name"><span>${p.name}</span>${myDone && paDone ? '<span class="both">🤍 Both prayed</span>' : ''}</div>
+      <div class="name"><span>${p.name}</span>${myDone && paDone && !split ? '<span class="both">🤍 Both prayed</span>' : ''}</div>
       <div class="boxes">
         <div class="slot">
           <button class="box ${myDone ? 'done' : ''}" data-tick="${p.id}" aria-pressed="${myDone}"
