@@ -245,6 +245,10 @@ button.box{cursor:pointer;font-family:inherit}
       <button class="btn hidden" id="notifOnBtn" type="button">Turn on notifications 🔔</button>
       <button class="btn secondary hidden" id="notifTestBtn" type="button">Send a test notification</button>
       <button class="btn ghost hidden" id="notifOffBtn" type="button">Turn off on this phone</button>
+      <div id="prefsBox" style="margin-top:14px">
+        <label class="row" style="margin:0;color:var(--text);font-size:15px;cursor:pointer"><span id="prefPrayedLabel">When my partner prays</span><input type="checkbox" id="prefPrayed" style="width:22px;height:22px"></label>
+        <label class="row" style="margin:0;color:var(--text);font-size:15px;cursor:pointer"><span id="prefSeenLabel">When my partner sees my reminder</span><input type="checkbox" id="prefSeen" style="width:22px;height:22px"></label>
+      </div>
     </div>
 
     <div class="card">
@@ -445,7 +449,7 @@ $('newPassBtn').onclick = async () => {
 async function loadAll(){
   const uid = S.session.user.id;
   const [{ data: profiles, error: e1 }, { data: pairs, error: e2 }] = await Promise.all([
-    sb.from('profiles').select('id,name,timezone,created_at'),
+    sb.from('profiles').select('id,name,timezone,created_at,notify_prayed,notify_seen'),
     sb.from('pairs').select('*'),
   ]);
   if (e1) throw e1; if (e2) throw e2;
@@ -461,7 +465,7 @@ async function loadAll(){
 
   const [pr, sent, inbox] = await Promise.all([
     sb.from('prayers').select('user_id,day,prayer,done').in('day', [...days]),
-    sb.from('reminders').select('prayer,day,created_at,to_user').eq('from_user', uid).gte('created_at', since),
+    sb.from('reminders').select('prayer,day,created_at,to_user,seen_at').eq('from_user', uid).gte('created_at', since),
     sb.from('reminders').select('id,prayer,message,created_at,from_user').eq('to_user', uid).is('seen_at', null).order('created_at',{ascending:true}),
   ]);
   if (pr.error) throw pr.error; if (sent.error) throw sent.error; if (inbox.error) throw inbox.error;
@@ -496,7 +500,21 @@ function subscribe(){
   if (S.channel) sb.removeChannel(S.channel);
   const uid = S.session.user.id;
   S.channel = sb.channel('salah-' + uid)
-    .on('postgres_changes', { event:'*', schema:'public', table:'prayers' }, scheduleRefresh)
+    .on('postgres_changes', { event:'*', schema:'public', table:'prayers' }, (p) => {
+      const r = p.new || {};
+      if (S.partner && r.user_id === S.partner.id && r.done && !S.prayers[key(r.user_id, r.day, r.prayer)]
+          && Object.values(myDays()).includes(r.day)){
+        toast(`🤍 ${firstName(S.partner.name)} prayed ${PRAYER_NAME[r.prayer] || ''}`);
+      }
+      scheduleRefresh();
+    })
+    .on('postgres_changes', { event:'UPDATE', schema:'public', table:'reminders', filter:'from_user=eq.' + uid }, (p) => {
+      const r = p.new || {};
+      if (S.partner && r.seen_at && !S.sentReminders.some(x => x.seen_at && x.created_at === r.created_at)){
+        toast(`🤍 ${firstName(S.partner.name)} saw your reminder`);
+      }
+      scheduleRefresh();
+    })
     .on('postgres_changes', { event:'*', schema:'public', table:'pairs' }, scheduleRefresh)
     .on('postgres_changes', { event:'UPDATE', schema:'public', table:'profiles' }, scheduleRefresh)
     .on('postgres_changes', { event:'INSERT', schema:'public', table:'reminders', filter:'to_user=eq.' + uid }, (p) => {
@@ -554,9 +572,9 @@ $('pairSettingsBtn').onclick = () => openSettings();
 function lastSent(prayer, day){
   let best = null;
   for (const r of S.sentReminders){
-    if (r.prayer === prayer && r.day === day && (!best || r.created_at > best)) best = r.created_at;
+    if (r.prayer === prayer && r.day === day && (!best || r.created_at > best.created_at)) best = r;
   }
-  return best ? new Date(best).getTime() : 0;
+  return best;
 }
 
 function renderHome(){
@@ -588,9 +606,10 @@ function renderHome(){
 
     let remind = '';
     if (canRemind && !paDone){
-      const until = lastSent(p.id, paDay) + S.cooldownMs;
+      const last = lastSent(p.id, paDay);
+      const until = last ? new Date(last.created_at).getTime() + S.cooldownMs : 0;
       remind = until > now
-        ? `<button class="remind" disabled>Reminder sent 🤍</button>`
+        ? `<button class="remind" disabled>${last.seen_at ? `Seen by ${esc(pName)} ✓` : 'Reminder sent 🤍'}</button>`
         : `<button class="remind" data-remind="${p.id}">Remind ${esc(pName)} 🤍</button>`;
     }
     return `<div class="prayer">
@@ -634,7 +653,7 @@ function renderInbox(){
   box.classList.remove('hidden');
   $('inboxOk').onclick = async () => {
     box.classList.add('hidden'); S.inbox = [];
-    try { await sb.rpc('mark_reminders_seen'); } catch(e){}
+    try { const { data: qid } = await sb.rpc('mark_reminders_seen'); sendQueued(qid); } catch(e){}
   };
 }
 
@@ -648,6 +667,8 @@ $('prayerList').onclick = async (e) => {
   if (r) return openReminder(r.dataset.remind);
 };
 
+function sendQueued(id){ if (id) sb.functions.invoke('send-push', { body: { reminder_id: id } }).catch(() => {}); }
+
 async function toggleTick(prayer){
   const md = myDays();
   const day = S.view === 'today' ? md.today : md.yesterday;
@@ -657,8 +678,9 @@ async function toggleTick(prayer){
   S.prayers[k] = next; S.busy.add(k); renderHome();
   try { navigator.vibrate && navigator.vibrate(15); } catch(e){}
   try {
-    const { error } = await sb.rpc('set_prayer', { p_day: day, p_prayer: prayer, p_done: next });
+    const { data: qid, error } = await sb.rpc('set_prayer', { p_day: day, p_prayer: prayer, p_done: next });
     if (error) throw error;
+    sendQueued(qid);
   } catch(err){
     S.prayers[k] = !next; renderHome(); toast(friendly(err));
   } finally { S.busy.delete(k); }
@@ -699,7 +721,7 @@ function openReminder(prayer){
       const { data: rid, error } = await sb.rpc('send_reminder', { p_prayer: prayer, p_message: text });
       if (error) throw error;
       close(); toast('Reminder sent 🤍');
-      if (rid) sb.functions.invoke('send-push', { body: { reminder_id: rid } }).catch(() => {});
+      sendQueued(rid);
       S.sentReminders.push({ prayer, day: partnerDays().today, created_at: new Date().toISOString() });
       renderHome();
     } catch(err){
@@ -735,6 +757,12 @@ function renderSettings(){
   }
   applyTheme(getTheme());
   updateNotifUI();
+  const pn = S.partner ? firstName(S.partner.name) : 'my partner';
+  $('prefPrayedLabel').textContent = `Tell me when ${pn} prays`;
+  $('prefSeenLabel').textContent = `Tell me when ${pn} sees my reminder`;
+  $('prefPrayed').checked = S.me.notify_prayed !== false;
+  $('prefSeen').checked = S.me.notify_seen !== false;
+  $('prefsBox').classList.toggle('hidden', !S.partner);
 }
 function openSettings(){ msg('settingsMsg',''); renderSettings(); show('settings'); }
 $('settingsBtn').onclick = openSettings;
@@ -874,6 +902,16 @@ async function updateNotifUI(){
   $('nudgeBtn').dataset.state = st;
 }
 $('notifOnBtn').onclick = enableNotifs;
+async function savePrefs(){
+  try {
+    const { error } = await sb.rpc('set_notify_prefs', { p_prayed: $('prefPrayed').checked, p_seen: $('prefSeen').checked });
+    if (error) throw error;
+    S.me.notify_prayed = $('prefPrayed').checked; S.me.notify_seen = $('prefSeen').checked;
+    toast('Saved 🤍');
+  } catch(err){ toast(friendly(err)); renderSettings(); }
+}
+$('prefPrayed').onchange = savePrefs;
+$('prefSeen').onchange = savePrefs;
 $('notifOffBtn').onclick = () => disableNotifs(false);
 $('notifTestBtn').onclick = async () => {
   $('notifTestBtn').disabled = true;
