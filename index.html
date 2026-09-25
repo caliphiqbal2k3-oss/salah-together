@@ -78,6 +78,7 @@ button.box{cursor:pointer;font-family:inherit}
 .box.done{border:1.5px solid transparent;background:var(--green-soft);color:var(--text)}
 .box.done .tick{animation:pop .35s ease}
 .box.partner{cursor:default}
+.box.notstarted{border-style:dotted;opacity:.6;font-size:14px}
 .remind{margin-top:8px;width:100%;border:0;background:var(--accent-soft);color:var(--text);border-radius:12px;padding:10px;font-size:14px;font-weight:500;cursor:pointer}
 .remind:disabled{opacity:.7;cursor:default}
 .slot{display:flex;flex-direction:column}
@@ -364,6 +365,7 @@ function parseInterval(v){
   return null;
 }
 const firstName = n => ((n || '').trim().split(/\s+/)[0] || '').replace(/[.,!?;:]+$/, '') || 'Partner';
+function dayMonth(ymd){ const [y,m,d] = ymd.split('-').map(Number); return new Date(Date.UTC(y,m-1,d,12)).toLocaleDateString('en-GB',{day:'numeric', month:'long', timeZone:'UTC'}); }
 function shortDay(ymd){ const [y,m,d] = ymd.split('-').map(Number); return new Date(Date.UTC(y,m-1,d,12)).toLocaleDateString('en-GB',{weekday:'short', day:'numeric', month:'short', timeZone:'UTC'}); }
 const key = (u,d,p) => `${u}|${d}|${p}`;
 function myDays(){ const t = dateIn(S.me.timezone); return {today:t, yesterday:minusDay(t)}; }
@@ -562,18 +564,20 @@ function renderHome(){
   const md = myDays(), pd = partnerDays();
   const isToday = S.view === 'today';
   const myDay = isToday ? md.today : md.yesterday;
-  const paDay = isToday ? pd.today : pd.yesterday;
+  // Both columns always show the SAME calendar date.
+  const paDay = myDay;
+  const notStarted = paDay > pd.today;       // partner is behind: this date hasn't begun for them
+  const canRemind = paDay === pd.today;       // reminders only for the partner's current day
   const pName = firstName(pa.name);
 
   const pdisp = prettyDate(myDay);
   $('dDay').textContent = isToday ? pdisp.day : 'Yesterday · ' + pdisp.day;
   $('dDate').textContent = pdisp.date;
-  $('pTime').textContent = `${pName}'s time: ${timeIn(pa.timezone)}` + (pd.today !== md.today ? ` · ${prettyDate(pd.today).day} there` : '');
+  $('pTime').textContent = `${pName}'s time: ${timeIn(pa.timezone)}` + (pd.today !== md.today ? ` · ${prettyDate(pd.today).day} ${dayMonth(pd.today)} there` : '');
   $('segToday').classList.toggle('on', isToday);
   $('segYest').classList.toggle('on', !isToday);
-  const split = paDay !== myDay;
-  $('colMe').textContent = split ? `You · ${shortDay(myDay)}` : 'You';
-  $('colPartner').textContent = split ? `${pName} · ${shortDay(paDay)}` : pName;
+  $('colMe').textContent = 'You';
+  $('colPartner').textContent = pName;
 
   let mine = 0, theirs = 0;
   const now = Date.now();
@@ -583,14 +587,14 @@ function renderHome(){
     if (myDone) mine++; if (paDone) theirs++;
 
     let remind = '';
-    if (isToday && !paDone){
+    if (canRemind && !paDone){
       const until = lastSent(p.id, paDay) + S.cooldownMs;
       remind = until > now
         ? `<button class="remind" disabled>Reminder sent 🤍</button>`
         : `<button class="remind" data-remind="${p.id}">Remind ${esc(pName)} 🤍</button>`;
     }
     return `<div class="prayer">
-      <div class="name"><span>${p.name}</span>${myDone && paDone && !split ? '<span class="both">🤍 Both prayed</span>' : ''}</div>
+      <div class="name"><span>${p.name}</span>${myDone && paDone ? '<span class="both">🤍 Both prayed</span>' : ''}</div>
       <div class="boxes">
         <div class="slot">
           <button class="box ${myDone ? 'done' : ''}" data-tick="${p.id}" aria-pressed="${myDone}"
@@ -599,8 +603,8 @@ function renderHome(){
           </button>
         </div>
         <div class="slot">
-          <div class="box partner ${paDone ? 'done' : ''}" role="img" aria-label="${p.name}, ${esc(pName)}: ${paDone ? 'prayed' : 'not ticked yet'}">
-            ${paDone ? '<span class="tick">✅</span> Prayed' : 'Not yet'}
+          <div class="box partner ${paDone ? 'done' : ''} ${notStarted && !paDone ? 'notstarted' : ''}" role="img" aria-label="${p.name}, ${esc(pName)}: ${paDone ? 'prayed' : (notStarted ? 'day not started yet' : 'not ticked yet')}">
+            ${paDone ? '<span class="tick">✅</span> Prayed' : (notStarted ? 'Day not started' : 'Not yet')}
           </div>
           ${remind}
         </div>
@@ -610,9 +614,12 @@ function renderHome(){
   $('prayerList').innerHTML = html;
 
   $('progress').innerHTML = `${isToday ? 'Today' : 'Yesterday'}: <b>You ${mine}/5</b> · <b>${esc(pName)} ${theirs}/5</b>`;
-  $('dayNote').textContent = isToday
-    ? (mine === 5 ? 'Alhamdulillah 🤍' : 'Keep going 🤍')
-    : 'You can still tick yesterday, for example an Isha prayed after midnight.';
+  let note;
+  if (notStarted) note = `${pName}'s ${dayMonth(paDay)} hasn't started yet (it's still ${prettyDate(pd.today).day} there). To remind ${pName}, open Yesterday 🤍`;
+  else if (!canRemind && isToday) note = `${pName}'s new day has started. You can remind ${pName} again after your midnight 🤍`;
+  else if (!isToday) note = 'You can still tick yesterday, for example an Isha prayed after midnight.';
+  else note = mine === 5 ? 'Alhamdulillah 🤍' : 'Keep going 🤍';
+  $('dayNote').textContent = note;
 
   renderInbox();
 }
